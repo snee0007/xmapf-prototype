@@ -184,69 +184,135 @@ def explain_path(agent):
         return (f"Agent {agent['id']} is on the optimal path — {actual} steps to goal "
                 f"with no agents blocking the direct route. It should arrive without further delays.")
 
-# ── Why Not Engine ───────────────────────────────────────────────────────────
+# ── Why Not Engine (Full Counterfactual) ─────────────────────────────────────
+
+def simulate_path(start_pos, goal_pos, all_positions, cols=64, strategy='vertical_first'):
+    """
+    Simulate what would happen if agent took a different route.
+    Returns: (path_cells, blocked_by, estimated_delays)
+    """
+    r, c = start_pos // cols, start_pos % cols
+    goal_r, goal_c = goal_pos // cols, goal_pos % cols
+    path = []
+    delays = 0
+    
+    for _ in range(40):
+        if r == goal_r and c == goal_c:
+            break
+            
+        # Choose next move based on strategy
+        if strategy == 'vertical_first':
+            if r != goal_r:
+                next_r = r + (1 if goal_r > r else -1)
+                next_c = c
+            else:
+                next_r = r
+                next_c = c + (1 if goal_c > c else -1)
+        elif strategy == 'horizontal_first':
+            if c != goal_c:
+                next_r = r
+                next_c = c + (1 if goal_c > c else -1)
+            else:
+                next_r = r + (1 if goal_r > r else -1)
+                next_c = c
+        elif strategy == 'diagonal':
+            # Try to move both dimensions simultaneously
+            next_r = r + (1 if goal_r > r else -1 if goal_r < r else 0)
+            next_c = c + (1 if goal_c > c else -1 if goal_c < c else 0)
+        
+        next_pos = next_r * cols + next_c
+        
+        # Check if blocked
+        if next_pos in all_positions:
+            delays += 1
+            path.append({'pos': r*cols+c, 'blocked': True, 'blocker': all_positions[next_pos]})
+        else:
+            r, c = next_r, next_c
+            path.append({'pos': r*cols+c, 'blocked': False, 'blocker': None})
+    
+    return path, delays
 
 def explain_why_not(agent):
     pos = agent['position']
     goal = agent['goal']
     cols = 64
-    curr_row, curr_col = pos // cols, pos % cols
-    goal_row, goal_col = goal // cols, goal % cols
-
-    agents = load_agents()
-    pos_set = {a['position']: a['id'] for a in agents if a['id'] != agent['id']}
-
-    # Alternative 1: go vertical first
-    alt1_cells = []
-    r, c = curr_row, curr_col
-    for _ in range(10):
-        if r != goal_row:
-            r += 1 if goal_row > r else -1
-        elif c != goal_col:
-            c += 1 if goal_col > c else -1
+    
+    # Load history for richer analysis
+    history = load_history()
+    agents_now = load_agents()
+    
+    # Build position map (excluding this agent)
+    pos_map = {a['position']: a['id'] for a in agents_now if a['id'] != agent['id']}
+    
+    # Simulate 3 alternative strategies
+    strategies = {
+        'vertical_first':   'Move vertically toward goal first, then horizontally',
+        'horizontal_first': 'Move horizontally toward goal first, then vertically',
+        'diagonal':         'Move diagonally (both dimensions simultaneously)'
+    }
+    
+    results = {}
+    for strategy, description in strategies.items():
+        path, sim_delays = simulate_path(pos, goal, pos_map, cols, strategy)
+        blocked_cells = [step for step in path if step['blocked']]
+        results[strategy] = {
+            'description': description,
+            'simulated_delays': sim_delays,
+            'blocked_count': len(blocked_cells),
+            'blockers': list(set([s['blocker'] for s in blocked_cells if s['blocker']]))[:3],
+            'path_length': len(path)
+        }
+    
+    # Find best alternative
+    best = min(results.items(), key=lambda x: x[1]['simulated_delays'])
+    worst = max(results.items(), key=lambda x: x[1]['simulated_delays'])
+    
+    # Compare with actual situation
+    actual_delays = agent['delays']
+    best_delays = best[1]['simulated_delays']
+    savings = actual_delays - best_delays
+    
+    # Build counterfactual explanation
+    lines = []
+    lines.append(f"Counterfactual analysis for Agent {agent['id']}:")
+    lines.append(f"")
+    
+    for strategy, result in results.items():
+        marker = "← BEST" if strategy == best[0] else ("← WORST" if strategy == worst[0] else "")
+        lines.append(f"  {result['description']}:")
+        if result['simulated_delays'] == 0:
+            lines.append(f"    → 0 simulated delays — path appears clear {marker}")
         else:
-            break
-        alt1_cells.append(r * cols + c)
-
-    # Alternative 2: go horizontal first
-    alt2_cells = []
-    r, c = curr_row, curr_col
-    for _ in range(10):
-        if c != goal_col:
-            c += 1 if goal_col > c else -1
-        elif r != goal_row:
-            r += 1 if goal_row > r else -1
-        else:
-            break
-        alt2_cells.append(r * cols + c)
-
-    # Check which cells are occupied
-    alt1_blocked = [pos_set[cell] for cell in alt1_cells if cell in pos_set]
-    alt2_blocked = [pos_set[cell] for cell in alt2_cells if cell in pos_set]
-
-    if not alt1_blocked and not alt2_blocked:
-        return (f"Agent {agent['id']} could take alternative routes — "
-                f"both vertical-first and horizontal-first paths appear clear. "
-                f"The current path was chosen by PIBT-D based on priority ordering "
-                f"at previous timesteps. With {agent['delays']} accumulated delays, "
-                f"it now has low priority and cannot claim preferred corridors.")
-    elif alt1_blocked and alt2_blocked:
-        all_blockers = list(set(alt1_blocked + alt2_blocked))[:3]
-        return (f"Agent {agent['id']} cannot take alternative routes either. "
-                f"Both the vertical-first path (blocked by Agent(s) {alt1_blocked[:2]}) "
-                f"and horizontal-first path (blocked by Agent(s) {alt2_blocked[:2]}) "
-                f"are occupied. Agent {agent['id']} is in a congestion deadlock — "
-                f"multiple high-priority agents are occupying all viable routes. "
-                f"Recommendation: reroute one of Agent(s) {all_blockers}.")
-    elif not alt1_blocked:
-        return (f"Agent {agent['id']} could take the vertical-first path which appears clear. "
-                f"The horizontal-first path is blocked by Agent(s) {alt2_blocked[:2]}. "
-                f"PIBT-D may not have chosen the vertical route due to priority conflicts "
-                f"at an earlier timestep. This is worth investigating.")
+            lines.append(f"    → {result['simulated_delays']} simulated delays, "
+                        f"blocked by Agent(s) {result['blockers']} {marker}")
+    
+    lines.append(f"")
+    
+    # Historical counterfactual
+    if '30' in history and savings > 0:
+        agent_t30 = next((a for a in history['30'] if a['id'] == agent['id']), None)
+        if agent_t30 and agent_t30['delays'] < 5:
+            lines.append(f"Historical insight: At t=30, Agent {agent['id']} had only "
+                        f"{agent_t30['delays']} delays and trend was '{agent_t30['trend']}'. "
+                        f"If rerouted then using {best[1]['description'].lower()}, "
+                        f"it could have avoided approximately {savings} of its current {actual_delays} delays.")
+    elif savings > 0:
+        lines.append(f"The {best[1]['description'].lower()} strategy "
+                    f"would have resulted in approximately {savings} fewer delays. "
+                    f"This suggests Agent {agent['id']} was routed into a high-traffic corridor "
+                    f"that could have been avoided.")
     else:
-        return (f"Agent {agent['id']} could take the horizontal-first path which appears clear. "
-                f"The vertical-first path is blocked by Agent(s) {alt1_blocked[:2]}. "
-                f"Consider manually routing Agent {agent['id']} horizontally first.")
+        lines.append(f"All alternative routes show similar delay counts. "
+                    f"Agent {agent['id']} appears to be in a genuinely congested area — "
+                    f"corridor redesign rather than rerouting may be needed.")
+    
+    # Add WoE-style conclusion
+    if best_delays == 0:
+        lines.append(f"")
+        lines.append(f"Recommendation: The {best[1]['description'].lower()} is currently clear. "
+                    f"Rerouting Agent {agent['id']} now could resolve its critical state.")
+    
+    return '\n'.join(lines)
 
 # ── Q&A Engine ────────────────────────────────────────────────────────────────
 
