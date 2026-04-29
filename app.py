@@ -3,6 +3,33 @@ import json, math, os
 
 app = Flask(__name__)
 DATA_PATH = os.path.join(os.path.dirname(__file__), 'agent_data.json')
+HISTORY_PATH = os.path.join(os.path.dirname(__file__), 'agent_history.json')
+
+def load_history():
+    try:
+        with open(HISTORY_PATH) as f:
+            return json.load(f)
+    except:
+        return {}
+
+def get_agent_history(agent_id):
+    history = load_history()
+    timesteps = [10, 20, 30, 40, 50]
+    progression = []
+    for t in timesteps:
+        key = str(t)
+        if key in history:
+            agent = next((a for a in history[key] if a['id'] == agent_id), None)
+            if agent:
+                progression.append({
+                    'timestep': t,
+                    'delays': agent['delays'],
+                    'trend': agent['trend'],
+                    'blocked_by': agent['blocked_by'],
+                    'distance': agent['distance'],
+                    'priority': agent['priority']
+                })
+    return progression
 
 def load_agents():
     with open(DATA_PATH) as f:
@@ -157,6 +184,70 @@ def explain_path(agent):
         return (f"Agent {agent['id']} is on the optimal path — {actual} steps to goal "
                 f"with no agents blocking the direct route. It should arrive without further delays.")
 
+# ── Why Not Engine ───────────────────────────────────────────────────────────
+
+def explain_why_not(agent):
+    pos = agent['position']
+    goal = agent['goal']
+    cols = 64
+    curr_row, curr_col = pos // cols, pos % cols
+    goal_row, goal_col = goal // cols, goal % cols
+
+    agents = load_agents()
+    pos_set = {a['position']: a['id'] for a in agents if a['id'] != agent['id']}
+
+    # Alternative 1: go vertical first
+    alt1_cells = []
+    r, c = curr_row, curr_col
+    for _ in range(10):
+        if r != goal_row:
+            r += 1 if goal_row > r else -1
+        elif c != goal_col:
+            c += 1 if goal_col > c else -1
+        else:
+            break
+        alt1_cells.append(r * cols + c)
+
+    # Alternative 2: go horizontal first
+    alt2_cells = []
+    r, c = curr_row, curr_col
+    for _ in range(10):
+        if c != goal_col:
+            c += 1 if goal_col > c else -1
+        elif r != goal_row:
+            r += 1 if goal_row > r else -1
+        else:
+            break
+        alt2_cells.append(r * cols + c)
+
+    # Check which cells are occupied
+    alt1_blocked = [pos_set[cell] for cell in alt1_cells if cell in pos_set]
+    alt2_blocked = [pos_set[cell] for cell in alt2_cells if cell in pos_set]
+
+    if not alt1_blocked and not alt2_blocked:
+        return (f"Agent {agent['id']} could take alternative routes — "
+                f"both vertical-first and horizontal-first paths appear clear. "
+                f"The current path was chosen by PIBT-D based on priority ordering "
+                f"at previous timesteps. With {agent['delays']} accumulated delays, "
+                f"it now has low priority and cannot claim preferred corridors.")
+    elif alt1_blocked and alt2_blocked:
+        all_blockers = list(set(alt1_blocked + alt2_blocked))[:3]
+        return (f"Agent {agent['id']} cannot take alternative routes either. "
+                f"Both the vertical-first path (blocked by Agent(s) {alt1_blocked[:2]}) "
+                f"and horizontal-first path (blocked by Agent(s) {alt2_blocked[:2]}) "
+                f"are occupied. Agent {agent['id']} is in a congestion deadlock — "
+                f"multiple high-priority agents are occupying all viable routes. "
+                f"Recommendation: reroute one of Agent(s) {all_blockers}.")
+    elif not alt1_blocked:
+        return (f"Agent {agent['id']} could take the vertical-first path which appears clear. "
+                f"The horizontal-first path is blocked by Agent(s) {alt2_blocked[:2]}. "
+                f"PIBT-D may not have chosen the vertical route due to priority conflicts "
+                f"at an earlier timestep. This is worth investigating.")
+    else:
+        return (f"Agent {agent['id']} could take the horizontal-first path which appears clear. "
+                f"The vertical-first path is blocked by Agent(s) {alt1_blocked[:2]}. "
+                f"Consider manually routing Agent {agent['id']} horizontally first.")
+
 # ── Q&A Engine ────────────────────────────────────────────────────────────────
 
 def answer_question(agent, question):
@@ -166,6 +257,10 @@ def answer_question(agent, question):
     woe_data = compute_woe(agent)
     blocked_by = agent.get('blocked_by', -1)
     trend = agent.get('trend', 'clear')
+
+    # WHY NOT questions
+    if any(w in q for w in ['why not', 'alternative', 'different path', 'other route', 'instead', 'shortcut']):
+        return {'answer': explain_why_not(agent), 'type': 'why_not', 'woe': woe_data}
 
     # PATH questions
     if any(w in q for w in ['path', 'route', 'shorter', 'why not', 'direction', 'detour']):
@@ -184,6 +279,21 @@ def answer_question(agent, question):
                      f"Its {agent['delays']} delays accumulated from corridor congestion over time — "
                      f"multiple agents passed through its path at different timesteps.")
         return {'answer': answer, 'type': 'blocker', 'woe': woe_data}
+
+    # HISTORY questions
+    elif any(w in q for w in ['history', 'over time', 'progression', 'when did', 'always', 'getting worse', 'timeline']):
+        history = get_agent_history(agent['id'])
+        if history:
+            progression = ' → '.join([f"t={h['timestep']}:{h['delays']}delays({h['trend']})" for h in history])
+            first = history[0]['delays']
+            last  = history[-1]['delays']
+            window = next((h['timestep'] for h in history if h['trend'] in ['worsening','critical']), None)
+            answer = (f"Agent {agent['id']} delay progression: {progression}. "
+                     f"Delays increased from {first} to {last} over 40 timesteps. "
+                     f"{'Early intervention at t='+str(window)+' could have prevented critical state.' if window else 'Situation developed gradually.'}")
+        else:
+            answer = f"No historical data available for Agent {agent['id']}."
+        return {'answer': answer, 'type': 'history', 'woe': woe_data}
 
     # TREND questions
     elif any(w in q for w in ['trend', 'getting worse', 'improving', 'pattern', 'history']):
@@ -274,9 +384,11 @@ def get_agent(agent_id):
     agent = get_agent_by_id(agent_id)
     if not agent: return jsonify({'error':'not found'}), 404
     woe_data = compute_woe(agent)
+    history = get_agent_history(agent_id)
     return jsonify({**agent, 'woe': woe_data,
                     'explanation': explain(agent,'auto'),
-                    'path_explanation': explain_path(agent)})
+                    'path_explanation': explain_path(agent),
+                    'history': history})
 
 @app.route('/api/explain/<int:agent_id>')
 def get_explanation(agent_id):
@@ -288,6 +400,38 @@ def get_explanation(agent_id):
         'causal':      explain(agent,'causal'),
         'path':        explain_path(agent),
         'woe':         compute_woe(agent)
+    })
+
+@app.route('/api/history/<int:agent_id>')
+def get_history(agent_id):
+    history = get_agent_history(agent_id)
+    if not history:
+        return jsonify({'error': 'No history found'}), 404
+    
+    # Compute trend analysis
+    if len(history) >= 2:
+        first = history[0]['delays']
+        last  = history[-1]['delays']
+        increase = last - first
+        if increase > 15:
+            analysis = f"Delays increased by {increase} over {len(history)} snapshots. Severe deterioration — should have been caught earlier."
+        elif increase > 8:
+            analysis = f"Delays increased by {increase} — significant worsening. Intervention window was between t={history[1]['timestep']} and t={history[2]['timestep']}."
+        elif increase > 3:
+            analysis = f"Delays increased by {increase} — moderate worsening. Situation developing but manageable."
+        else:
+            analysis = f"Minimal change ({increase} delay increase). Situation is stable."
+    else:
+        analysis = "Insufficient history for trend analysis."
+    
+    return jsonify({
+        'agent_id': agent_id,
+        'history': history,
+        'analysis': analysis,
+        'intervention_window': next(
+            (h['timestep'] for h in history if h['trend'] in ['worsening','critical']),
+            None
+        )
     })
 
 @app.route('/api/ask', methods=['POST'])

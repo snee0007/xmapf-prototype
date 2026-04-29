@@ -164,9 +164,23 @@ svg#grid { border: 1px solid #2d3048; border-radius: 8px; background: #13161f; }
       <button class="quick-btn" onclick="quickAsk('Who is blocking this agent?')">Who blocks it?</button>
       <button class="quick-btn" onclick="quickAsk('Why is it taking this path?')">Path reason?</button>
       <button class="quick-btn" onclick="quickAsk('What is the trend?')">Trend?</button>
+      <button class="quick-btn" onclick="quickAsk('Show me the history of this agent')">History?</button>
+      <button class="quick-btn" onclick="quickAsk('Why not take a different path?')">Why not?</button>
     </div>
 
-    <div class="chat-input-row">
+    <div id="history-timeline" style="display:none;padding:10px 14px;border-top:1px solid #2d3048;background:#0f1117;">
+  <p style="font-size:10px;color:#888780;text-transform:uppercase;letter-spacing:0.05em;margin:0 0 8px;">Delay progression over time</p>
+  <div style="display:flex;align-items:flex-end;gap:6px;height:60px;" id="history-bars"></div>
+  <div style="display:flex;justify-content:space-between;margin-top:4px;">
+    <span style="font-size:9px;color:#888780;">t=10</span>
+    <span style="font-size:9px;color:#888780;">t=20</span>
+    <span style="font-size:9px;color:#888780;">t=30</span>
+    <span style="font-size:9px;color:#888780;">t=40</span>
+    <span style="font-size:9px;color:#888780;">t=50</span>
+  </div>
+  <p id="history-analysis" style="font-size:11px;color:#888780;margin:6px 0 0;"></p>
+</div>
+<div class="chat-input-row">
       <input id="chat-input" type="text" placeholder="Ask about this agent..." onkeydown="if(event.key==='Enter')sendMsg()">
       <button id="send-btn" onclick="sendMsg()">Ask</button>
     </div>
@@ -309,6 +323,37 @@ async function selectAgent(agent) {
         <div style="font-size:9px;color:#888780;">urgency</div>
       </div>
     </div>`;
+
+  // Load history timeline
+  try {
+    const histRes = await fetch(`/api/history/${agent.id}`);
+    if(histRes.ok) {
+      const histData = await histRes.json();
+      const timeline = document.getElementById('history-timeline');
+      const bars = document.getElementById('history-bars');
+      const analysis = document.getElementById('history-analysis');
+      timeline.style.display = 'block';
+      bars.innerHTML = '';
+      const maxDelay = Math.max(...histData.history.map(h => h.delays), 1);
+      const colors = {minor:'#8aab6a', moderate:'#BA7517', worsening:'#E24B4A', critical:'#ff0000', clear:'#378ADD'};
+      histData.history.forEach(h => {
+        const pct = (h.delays / maxDelay * 100);
+        const col = colors[h.trend] || '#888780';
+        const bar = document.createElement('div');
+        bar.style.cssText = `flex:1;background:${col};border-radius:3px 3px 0 0;height:${Math.max(pct,5)}%;position:relative;`;
+        bar.title = `t=${h.timestep}: ${h.delays} delays (${h.trend})`;
+        const label = document.createElement('div');
+        label.style.cssText = 'position:absolute;top:-16px;width:100%;text-align:center;font-size:9px;color:#e8e6e1;';
+        label.textContent = h.delays;
+        bar.appendChild(label);
+        bars.appendChild(bar);
+      });
+      analysis.textContent = histData.analysis;
+      if(histData.intervention_window) {
+        analysis.textContent += ` Intervention window: t=${histData.intervention_window}.`;
+      }
+    }
+  } catch(e) { console.log('No history:', e); }
 
   // Clear chat and show welcome
   const msgs = document.getElementById('chat-messages');
